@@ -4,7 +4,7 @@
 
 ## Why this exists
 
-- **GPT-5** dropped and Burp Suite added an AI helper in Repeater. Great feature… but the **credit model burns through usage** fast. I don’t want to keep buying more just to test a couple endpoints.
+- **GPT-5** dropped and Burp Suite(v2025.8) added an AI helper in Repeater. Great feature… but the **credit model burns through usage** fast. I don’t want to keep buying more just to test a couple endpoints.
 - So I built a bare-bones alternative that **talks to a local model** (Ollama) and wires the output straight into Burp. It’s not a feature-for-feature clone of Burp’s AI — yet — but it’s enough to speed up exploration without a running meter.
 
 ## What it does (today)
