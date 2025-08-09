@@ -42,3 +42,49 @@
   ollama serve
   ollama list
   # make sure your model is present, e.g. deepseek-r1:14b
+- Endpoint URL in the UI defaults to `http://127.0.0.1:11434/v1/chat/completions`.
+
+## Build
+
+  ```bash
+  mvn -q -DskipTests package
+  # Load the shaded jar:
+  # target/local-llm-assistant-1.0.0-shaded.jar
+  ```
+We build a fat JAR (shaded) so Jackson is available at runtime inside Burp.
+
+
+## Requirements
+
+- Extensions → Add → Select JAR: target/local-llm-assistant-1.0.0-shaded.jar.
+- Open the Local LLM tab.
+- In Repeater, right-click inside a request editor → Local LLM → Use this request as seed.
+- In the tab, write a prompt (or paste your YAML), click Send.
+- Watch Logger (Sources → Extensions) for sent traffic.
+
+
+## Example YAML Format
+
+- To force clean output (no filler), keep the “Payloads only (YAML)” option on. Example prompt:
+  ```yaml
+  payloads:
+    - { name: sqli_true, param: q, payload: "1' OR '1'='1", type: URL }
+    - { name: time_oracle, param: q, payload: "'; WAITFOR DELAY '0:0:05'--", type: URL }
+    - { name: xss_cookie, param: name, payload: "<script>alert(1)</script>", type: COOKIE }
+    - { name: json_flip, param: admin, payload: "true", type: JSON }
+  ```
+  
+
+## Notes
+
+- All payload values must be quoted strings, even if they contain JSON.
+If the model forgets, the extension attempts a safe auto-fix.
+
+
+## Options Explained:
+
+- Stream: stream output from the model (nice when it works; turn off for easier debug).
+- Payloads only (YAML): enforce a single fenced YAML block with payloads: [...].
+- Strip <think>: remove chain-of-thought noise if your model emits <think> blocks.
+- Send via Burp: actually fire the generated payloads (through Burp’s HTTP stack).
+- Also add to Repeater: each mutation is queued in Repeater with caption LLM/<name>.
