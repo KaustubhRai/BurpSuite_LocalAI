@@ -5,8 +5,7 @@ on:
     branches: [ main ]
 
 permissions:
-  contents: write 
-  actions: read
+  contents: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -15,12 +14,11 @@ concurrency:
 jobs:
   cut-release:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # we need HEAD^ to diff versions
+          fetch-depth: 0
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -34,91 +32,50 @@ jobs:
         run: |
           NEW_VER=$(mvn -q -DforceStdout -Dexpression=project.version help:evaluate)
           echo "value=$NEW_VER" >> $GITHUB_OUTPUT
-          echo "NEW_VER=$NEW_VER" >> $GITHUB_ENV
 
       - name: Read version (previous commit)
         id: ver_old
         run: |
           if git rev-parse HEAD^ >/dev/null 2>&1; then
             OLD_POM=$(git show HEAD^:pom.xml || true)
-            # Grab FIRST top-level <version> occurrence
             OLD_VER=$(printf "%s" "$OLD_POM" | sed -n '0,/<version>/s|.*<version>\(.*\)</version>.*|\1|p' | head -n1)
           else
             OLD_VER=""
           fi
           echo "value=$OLD_VER" >> $GITHUB_OUTPUT
-          echo "OLD_VER=$OLD_VER" >> $GITHUB_ENV
 
       - name: Decide if release is needed
         id: gate
         run: |
           if [ "${{ steps.ver_new.outputs.value }}" = "${{ steps.ver_old.outputs.value }}" ]; then
             echo "changed=false" >> $GITHUB_OUTPUT
-            echo "No version bump (old=${{ steps.ver_old.outputs.value }}, new=${{ steps.ver_new.outputs.value }}). Skipping release."
           else
             echo "changed=true" >> $GITHUB_OUTPUT
-            echo "Version bump detected: ${{ steps.ver_old.outputs.value }} -> ${{ steps.ver_new.outputs.value }}"
           fi
 
       - name: Build shaded jar
         if: steps.gate.outputs.changed == 'true'
-        run: |
-          mvn -B -DskipTests clean package
-          ls -lah target
+        run: mvn -B -DskipTests clean package
 
-      - name: Locate artifact
+      - name: Check if release already exists
         if: steps.gate.outputs.changed == 'true'
-        id: locate
-        run: |
-          VER="${{ steps.ver_new.outputs.value }}"
-          # Your shade plugin produces two jars: original-* and shaded (final)
-          FILE="target/local-llm-assistant-${VER}.jar"
-          if [ ! -f "$FILE" ]; then
-            echo "Shaded jar not found at $FILE"
-            ls -lah target
-            exit 1
-          fi
-          NAME_FOR_RELEASE="Local-LLM-Assistant-${VER}.jar"
-          cp "$FILE" "$NAME_FOR_RELEASE"
-          echo "file=$NAME_FOR_RELEASE" >> $GITHUB_OUTPUT
-
-      - name: Create tag if missing
-        if: steps.gate.outputs.changed == 'true'
+        id: check
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           TAG="v${{ steps.ver_new.outputs.value }}"
-          REPO="${{ github.repository }}"
-          # Check if tag exists
-          set -e
-          http_code=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/git/ref/tags/${TAG}")
-          if [ "$http_code" = "200" ]; then
-            echo "Tag ${TAG} already exists."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
           else
-            echo "Creating tag ${TAG} at $GITHUB_SHA"
-            curl -s -X POST \
-              -H "Authorization: Bearer $GITHUB_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              https://api.github.com/repos/${REPO}/git/refs \
-              -d @- <<EOF
-            {
-              "ref": "refs/tags/${TAG}",
-              "sha": "${GITHUB_SHA}"
-            }
-EOF
-            echo "Tag ${TAG} created."
+            echo "exists=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Create GitHub Release
-        if: steps.gate.outputs.changed == 'true'
+        if: steps.gate.outputs.changed == 'true' && steps.check.outputs.exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.ver_new.outputs.value }}
           name: Local LLM Assistant v${{ steps.ver_new.outputs.value }}
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
-          files: ${{ steps.locate.outputs.file }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          files: target/local-llm-assistant-${{ steps.ver_new.outputs.value }}.jar
