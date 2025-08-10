@@ -17,11 +17,15 @@ import javax.swing.border.EmptyBorder;
 import java.awt.*;
 import java.awt.event.ActionEvent;
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpResponse.BodyHandlers;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.*;
+import java.util.Base64;
 import java.util.List;
+import java.util.concurrent.Callable;
 import java.util.stream.Collectors;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -68,15 +72,8 @@ public class BurpExtender implements BurpExtension {
                             return;
                         }
 
-                        // Set the captured request as seed and prefill with example payload prompt
+                        // Set the captured request as seed
                         panel.setSeed(m);
-                        String prefilled = """
-                                Return only a single fenced YAML block.
-                                payloads:
-                                  - { name: "boolean true", param: q, payload: "' OR '1'='1' --", type: URL }
-                                  - { name: "time delay",   param: q, payload: "'; WAITFOR DELAY '0:0:05'--", type: URL }
-                                """;
-                        panel.setPrompt(prefilled);
                         api.logging().logToOutput("[LocalLLM] Seed set.");
                     }
                 });
@@ -96,24 +93,38 @@ public class BurpExtender implements BurpExtension {
         private final MontoyaApi api;
         
         // LLM API configuration fields
-        private final JTextField baseUrlField = new JTextField("http://127.0.0.1:11434/v1/chat/completions");
-        private final JTextField modelField = new JTextField("deepseek-r1:14b");
-        private final JSpinner tempSpinner = new JSpinner(new SpinnerNumberModel(0.2, 0.0, 2.0, 0.1));
-        private final JSpinner maxTokSpinner = new JSpinner(new SpinnerNumberModel(2048, 128, 32768, 128));
+        private final JTextField baseUrlField = new JTextField("http://127.0.0.1:11434/api/chat");
+        private final JTextField modelField = new JTextField("gemma3:4b");
+        private final JSpinner tempSpinner = new JSpinner(new SpinnerNumberModel(0.15, 0.0, 2.0, 0.05));
+        private final JSpinner maxTokSpinner = new JSpinner(new SpinnerNumberModel(256, 64, 8192, 64));
 
         // Feature toggle checkboxes
-        private final JCheckBox streamBox = new JCheckBox("Stream", true);
+        private final JCheckBox streamBox = new JCheckBox("Stream", false);
         private final JCheckBox yamlOnlyBox = new JCheckBox("Payloads only (YAML)", true);
-        private final JCheckBox stripThinkBox = new JCheckBox("Strip <think>", true);
+        private final JCheckBox stripThinkBox = new JCheckBox("Strip <think>", false);
         private final JCheckBox debugBox = new JCheckBox("Debug lines", false);
         private final JCheckBox fireBox = new JCheckBox("Send via Burp", true);
         private final JCheckBox repeaterBox = new JCheckBox("Also add to Repeater", false);
+
+        // command mode: generate from short intent
+        private final JCheckBox commandModeBox = new JCheckBox("Command mode", true);
+        private final JComboBox<String> familyCombo =
+                new JComboBox<>(new String[]{"NoSQL","SQL","XSS","PathTraversal","CommandInjection"});
+        private final JComboBox<String> whereCombo =
+                new JComboBox<>(new String[]{"URL","BODY","JSON","COOKIE"});
+        private final JSpinner countSpinner = new JSpinner(new SpinnerNumberModel(5, 1, 20, 1));
+
+        // Encoding controls
+        private final JCheckBox encodeBox = new JCheckBox("Encode variants", false);
+        private final JComboBox<String> encodeTypeCombo = new JComboBox<>(new String[]{"URL","Base64","HTML"});
 
         // UI components for input/output
         private final JLabel seedLabel = new JLabel("Seed: <none>");
         private final JTextArea promptArea = new JTextArea(12, 120);
         private final JTextArea outArea = new JTextArea(22, 120);
         private final JButton sendBtn = new JButton("Send");
+        private final JButton clearBtn = new JButton("Clear");
+        private volatile long tSendNs = 0L;
 
         // HTTP client for LLM API calls
         private final HttpClient http = HttpClient.newBuilder()
@@ -125,6 +136,7 @@ public class BurpExtender implements BurpExtension {
         private final ObjectMapper yaml = new ObjectMapper(new YAMLFactory());
         private HttpRequestResponse seed; // The base request to modify with payloads
 
+        
         /**
          * Constructs the UI layout with settings, prompt area, and output area
          */
@@ -160,14 +172,38 @@ public class BurpExtender implements BurpExtension {
             c.gridx = 0; c.gridy = row; settings.add(new JLabel("Max Tokens"), c);
             c.gridx = 1; c.gridy = row++; settings.add(maxTokSpinner, c);
 
-            // Checkbox options panel
-            JPanel opts = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 0));
-            opts.add(streamBox);
-            opts.add(yamlOnlyBox);
-            opts.add(stripThinkBox);
-            opts.add(debugBox);
-            opts.add(fireBox);
-            opts.add(repeaterBox);
+            // Checkbox options panel (split into two rows so nothing is clipped)
+            JPanel row1 = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 0));
+            row1.add(streamBox);
+            row1.add(yamlOnlyBox);
+            row1.add(stripThinkBox);
+            row1.add(debugBox);
+            row1.add(fireBox);
+            row1.add(repeaterBox);
+
+            JPanel row2 = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 0));
+            row2.add(new JLabel("Mode:"));
+            row2.add(commandModeBox);
+            row2.add(new JLabel("Family:"));
+            row2.add(familyCombo);
+            row2.add(new JLabel("Where:"));
+            row2.add(whereCombo);
+            row2.add(new JLabel("#:"));
+            row2.add(countSpinner);
+            row2.add(new JLabel("Encode:"));
+            row2.add(encodeBox);
+            row2.add(encodeTypeCombo);
+
+            // Enable/disable the encode type selector with the checkbox
+            encodeTypeCombo.setEnabled(false);
+            encodeBox.addActionListener(ev -> encodeTypeCombo.setEnabled(encodeBox.isSelected()));
+
+            // Parent panel that stacks both rows vertically
+            JPanel opts = new JPanel();
+            opts.setLayout(new BoxLayout(opts, BoxLayout.Y_AXIS));
+            opts.add(row1);
+            opts.add(row2);
+
 
             // Assemble top section (settings + prompt input + options)
             JPanel top = new JPanel(new BorderLayout(0,6));
@@ -181,7 +217,12 @@ public class BurpExtender implements BurpExtension {
             bottom.add(new JScrollPane(outArea), BorderLayout.CENTER);
 
             JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+            actions.add(clearBtn);
             actions.add(sendBtn);
+            clearBtn.addActionListener(e -> {
+                outArea.setText("");
+                outArea.setCaretPosition(0);
+            });
             bottom.add(actions, BorderLayout.SOUTH);
 
             add(top, BorderLayout.NORTH);
@@ -190,6 +231,67 @@ public class BurpExtender implements BurpExtension {
             sendBtn.addActionListener(e -> sendPromptAndMaybeFire());
         }
 
+        private String buildInstructionFromSeed(String userIntent) {
+                HttpRequest r = (seed != null) ? seed.request() : null;
+
+                // Gather param names from the seed by location
+                List<String> urlParams  = new ArrayList<>();
+                List<String> bodyParams = new ArrayList<>();
+                List<String> jsonParams = new ArrayList<>();
+                for (HttpParameter p : (r != null ? r.parameters() : List.<HttpParameter>of())) {
+                    switch (p.type()) {
+                        case URL  -> urlParams.add(p.name());
+                        case BODY -> bodyParams.add(p.name());
+                        case JSON -> jsonParams.add(p.name());
+                        default -> {}
+                    }
+                }
+                // Cookies: just surface names if present
+                String cookieHeader = (r != null) ? r.headerValue("Cookie") : null;
+                List<String> cookieParams = new ArrayList<>();
+                if (cookieHeader != null && !cookieHeader.isBlank()) {
+                    for (String part : cookieHeader.split(";\\s*")) {
+                        int eq = part.indexOf('=');
+                        if (eq > 0) cookieParams.add(part.substring(0, eq));
+                    }
+                }
+
+                String family = String.valueOf(familyCombo.getSelectedItem());
+                String where  = String.valueOf(whereCombo.getSelectedItem());
+                int count     = ((Number) countSpinner.getValue()).intValue();
+
+                // Choose allowed param names for the target location
+                List<String> allowed = switch (where) {
+                    case "URL"    -> urlParams;
+                    case "BODY"   -> bodyParams;
+                    case "JSON"   -> jsonParams;
+                    case "COOKIE" -> cookieParams;
+                    default       -> urlParams;
+                };
+                // If none found, give a sensible default so the model can proceed
+                if (allowed.isEmpty()) {
+                    allowed = List.of("q","search","id","name");
+                }
+
+                // Single, strict instruction the model must follow
+                return """
+                    Intent: %s
+
+                    Generate exactly %d %s injection probes targeting %s parameters.
+                    Use ONLY these parameter names: %s
+                    Rules:
+                    - Return ONE fenced YAML block and nothing else.
+                    - Schema:
+                        payloads:
+                        - { name: "...", param: <one-of-allowed>, payload: "<string>", type: %s }
+                    - Every payload MUST be a quoted string.
+                    - Prefer low-noise, high-signal probes (boolean, regex, $ne/$gt/$where for NoSQL; boolean/time for SQL, etc.).
+                    """.formatted(
+                        userIntent == null || userIntent.isBlank() ? "Generate payloads" : userIntent,
+                        count, family, where, allowed, where
+                );
+        }
+        
         // Setter methods for external components
         void setSeed(HttpRequestResponse seed) {
             this.seed = seed;
@@ -210,8 +312,10 @@ public class BurpExtender implements BurpExtension {
 
         // Helper to append text to output area and scroll to bottom
         private void appendOut(String s) {
-            outArea.append(s);
-            outArea.setCaretPosition(outArea.getDocument().getLength());
+            SwingUtilities.invokeLater(() -> {
+                outArea.append(s);
+                outArea.setCaretPosition(outArea.getDocument().getLength());
+            });
         }
 
         // ========================= LLM API COMMUNICATION =========================
@@ -223,7 +327,9 @@ public class BurpExtender implements BurpExtension {
         private void sendPromptAndMaybeFire() {
             String url = baseUrl();
             String model = model();
-            String user = promptArea.getText();
+            String promptText = promptArea.getText().trim();
+            boolean useCommand = commandModeBox.isSelected() && promptText.isBlank();
+            String user = useCommand ? buildInstructionFromSeed("") : promptText;
             boolean stream = streamBox.isSelected();
 
             if (user.isBlank()) {
@@ -231,6 +337,8 @@ public class BurpExtender implements BurpExtension {
                 return;
             }
 
+            // mark overall start time
+            tSendNs = System.nanoTime();
             appendOut("\n=== Request @ " + java.time.LocalTime.now() + " ===\n");
             appendOut("Model: " + model + "\n");
 
@@ -244,7 +352,23 @@ public class BurpExtender implements BurpExtension {
 
             try {
                 // Build OpenAI-compatible chat completion request
-                String body = "{"
+                String body;
+                boolean usingOllama = baseUrl().contains("/api/");  // native Ollama if true
+                if (usingOllama) {
+                    body = "{"
+                        + "\"model\":\"" + escape(model) + "\","
+                        + "\"stream\":" + stream + ","
+                        + "\"messages\":["
+                        + "{\"role\":\"system\",\"content\":\"" + escape(sys) + "\"},"
+                        + "{\"role\":\"user\",\"content\":\"" + escape(user) + "\"}"
+                        + "],"
+                        + "\"options\":{"
+                        + "\"temperature\":" + temperature() + ","
+                        + "\"num_predict\":" + maxTokens()
+                        + "}"
+                        + "}";
+                } else {
+                    body = "{"
                         + "\"model\":\"" + escape(model) + "\","
                         + "\"messages\":["
                         + "{\"role\":\"system\",\"content\":\"" + escape(sys) + "\"},"
@@ -254,6 +378,9 @@ public class BurpExtender implements BurpExtension {
                         + "\"max_tokens\":" + maxTokens() + ","
                         + "\"stream\":" + stream
                         + "}";
+                }
+
+
 
                 java.net.http.HttpRequest req = java.net.http.HttpRequest.newBuilder()
                         .uri(URI.create(url))
@@ -285,8 +412,12 @@ public class BurpExtender implements BurpExtension {
                     http.sendAsync(req, BodyHandlers.ofString())
                             .thenAccept(resp -> {
                                 appendOut("[HTTP " + resp.statusCode() + "]\n");
-                                String text = Json.extractMessage(resp.body());
-                                if (text == null) text = resp.body();
+                                String raw = resp.body();
+                                if (resp.statusCode() >= 400) {
+                                    appendOut("[error-body] " + raw + "\n");
+                                }
+                                String text = Json.extractMessage(raw);
+                                if (text == null) text = raw;
                                 if (stripThinkBox.isSelected()) text = stripThink(text);
                                 handleModelOutput(text);
                             })
@@ -307,6 +438,9 @@ public class BurpExtender implements BurpExtension {
                     appendOut("\n[parse] No YAML block found.\n");
                     return;
                 }
+                long nowNs = System.nanoTime();
+                appendOut(String.format("[gen] YAML ready @ %s  (+%d ms)\n", 
+                        java.time.LocalTime.now(), (nowNs - tSendNs) / 1_000_000));
                 appendOut("\n" + y + "\n");
                 if (fireBox.isSelected()) fireFromYaml(y);
             } else {
@@ -359,7 +493,10 @@ public class BurpExtender implements BurpExtension {
          * Executes each payload by modifying the seed request and sending via Burp
          */
         private void processPayloads(PayloadSpec spec) {
-            HttpRequest base = seed.request(); // Burp request
+            // Fan-out degree; you can tune this (6–8 is a good start)
+            final int MAX_PAR = 6;
+
+            HttpRequest base = seed.request();
             Http httpApi = api.http();
             Repeater repeater = api.repeater();
 
@@ -367,53 +504,90 @@ public class BurpExtender implements BurpExtension {
                 appendOut("[debug] Base: " + base.method() + " " + base.path() + "\n");
             }
 
-            appendOut("[fire] " + spec.payloads.size() + " payload(s). Sending via Burp…\n");
+            long fireStartNs = System.nanoTime();
+            appendOut("[fire] " + spec.payloads.size() + " payload(s). Sending via Burp in parallel…\n");
 
+            // Determine encoding selection once
+            final boolean doEncode = encodeBox.isSelected();
+            final String encKind = doEncode ? String.valueOf(encodeTypeCombo.getSelectedItem()) : null;
+
+            // Build tasks up-front
+            java.util.List<Callable<String>> tasks = new java.util.ArrayList<>();
             for (Payload p : spec.payloads) {
-                String name = nz(p.name, p.param);
-                String param = p.param;
-                String value = p.payload;
-
-                HttpRequest mutated = base;
-
-                // Handle cookie parameters specially (merge into Cookie header)
-                if ("COOKIE".equalsIgnoreCase(String.valueOf(p.type))) {
-                    String current = mutated.headerValue("Cookie");
-                    String merged = BurpExtender.mergeCookie(current, param, value);
-                    mutated = mutated.withHeader("Cookie", merged);
-                } else {
-                    // Handle URL/BODY/JSON parameters via Burp's parameter API
-                    HttpParameterType type = chooseType(p.type, base);
-                    HttpParameter hp = HttpParameter.parameter(param, value, type);
-                    mutated = base.withParameter(hp); // add or update
+                // Build variants: normal + encoded (if selected)
+                java.util.List<String[]> variants = new java.util.ArrayList<>();
+                variants.add(new String[] {"", p.payload}); // normal
+                if (doEncode) {
+                    variants.add(new String[] {" [enc=" + encKind + "]", encodeValue(p.payload, encKind)});
                 }
 
-                if (debugBox.isSelected()) {
-                    appendOut(String.format("[debug] %s -> %s (%s)\n", name, param,
-                            p.type == null ? "AUTO" : p.type));
-                }
+                for (String[] vv : variants) {
+                    final String nameSuffix = vv[0];
+                    final String valueVariant = vv[1];
 
-                // Send the modified request and measure response time
-                long t0 = System.nanoTime();
-                HttpRequestResponse rr = httpApi.sendRequest(mutated);
-                long dtMs = (System.nanoTime() - t0) / 1_000_000;
+                    tasks.add(() -> {
+                        String name = nz(p.name, p.param) + nameSuffix;
+                        String param = p.param;
+                        String value = valueVariant;
 
-                // Log response details
-                HttpResponse r = rr.response();
-                int sc = (r == null) ? -1 : r.statusCode();
-                int blen = (r == null || r.body() == null) ? 0 : r.body().length();
+                        HttpRequest mutated = base;
 
-                appendOut(String.format("  - %s (%s.%s) => %d %dB %dms\n",
-                        name, param, (p.type == null ? "AUTO" : p.type), sc, blen, dtMs));
+                        // Handle cookie parameters specially (merge into Cookie header)
+                        if ("COOKIE".equalsIgnoreCase(String.valueOf(p.type))) {
+                            String current = mutated.headerValue("Cookie");
+                            String merged = BurpExtender.mergeCookie(current, param, value);
+                            mutated = mutated.withHeader("Cookie", merged);
+                        } else {
+                            // Handle URL/BODY/JSON parameters via Burp's parameter API
+                            HttpParameterType type = chooseType(p.type, base);
+                            HttpParameter hp = HttpParameter.parameter(param, value, type);
+                            mutated = base.withParameter(hp);
+                        }
 
-                // Optionally send to Repeater for manual testing
-                if (repeaterBox.isSelected()) {
-                    repeater.sendToRepeater(mutated, "LLM/" + name);
+                        // Send the modified request and measure response time
+                        long t0 = System.nanoTime();
+                        HttpRequestResponse rr = httpApi.sendRequest(mutated);
+                        long dtMs = (System.nanoTime() - t0) / 1_000_000;
+
+                        // Log response details
+                        HttpResponse r = rr.response();
+                        int sc = (r == null) ? -1 : r.statusCode();
+                        int blen = (r == null || r.body() == null) ? 0 : r.body().length();
+
+                        if (repeaterBox.isSelected()) {
+                            repeater.sendToRepeater(mutated, "LLM/" + name);
+                        }
+
+                        return String.format("  - %s (%s.%s) => %d %dB %dms\n",
+                                name, param, (p.type == null ? "AUTO" : p.type), sc, blen, dtMs);
+                    });
                 }
             }
 
-            appendOut("[fire] Done.\n");
+            // Run tasks off-EDT
+            java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(MAX_PAR);
+            try {
+                java.util.List<java.util.concurrent.Future<String>> futures = pool.invokeAll(tasks);
+                for (java.util.concurrent.Future<String> f : futures) {
+                    try {
+                        appendOut(f.get());
+                    } catch (Exception ex) {
+                        appendOut("  - [error] " + ex + "\n");
+                    }
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                appendOut("[fire] interrupted\n");
+            } finally {
+                pool.shutdown();
+            }
+
+            long fireMs = (System.nanoTime() - fireStartNs) / 1_000_000;
+            long totalMs = (System.nanoTime() - tSendNs) / 1_000_000;
+            appendOut(String.format("[fire] Done @ %s  (fire=%d ms, total=%d ms)\n",
+                    java.time.LocalTime.now(), fireMs, totalMs));
         }
+
 
         // Helper method to use first non-blank string
         private static String nz(String a, String b) { return (a != null && !a.isBlank()) ? a : b; }
@@ -509,6 +683,44 @@ public class BurpExtender implements BurpExtension {
         private static String escape(String s) {
             return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n");
         }
+
+        // ========================= ENCODING UTILITIES =========================
+        private static String encodeValue(String value, String kind) {
+            if (value == null) return null;
+            if (kind == null) return value;
+            switch (kind) {
+                case "URL":
+                    return URLEncoder.encode(value, StandardCharsets.UTF_8);
+                case "Base64":
+                    return Base64.getEncoder().encodeToString(value.getBytes(StandardCharsets.UTF_8));
+                case "HTML":
+                    return htmlEscape(value);
+                default:
+                    return value;
+            }
+        }
+
+        private static String htmlEscape(String s) {
+            if (s == null) return null;
+            StringBuilder out = new StringBuilder(s.length() + 16);
+            for (int i = 0; i < s.length(); i++) {
+                char ch = s.charAt(i);
+                switch (ch) {
+                    case '&': out.append("&amp;"); break;
+                    case '<': out.append("&lt;"); break;
+                    case '>': out.append("&gt;"); break;
+                    case '\"': out.append("&quot;"); break;
+                    case '\'': out.append("&#x27;"); break;
+                    default:
+                        if (ch < 32 || ch > 126) {
+                            out.append("&#x").append(Integer.toHexString(ch)).append(";");
+                        } else {
+                            out.append(ch);
+                        }
+                }
+            }
+            return out.toString();
+        }
     }
 
     // ========================= DATA MODELS =========================
@@ -529,6 +741,7 @@ public class BurpExtender implements BurpExtension {
      * Merges a new cookie value into existing Cookie header string
      */
     static String mergeCookie(String cookieHeader, String name, String value) {
+        if (name == null || name.isBlank()) return cookieHeader; // Add validation
         Map<String,String> map = new LinkedHashMap<>();
         if (cookieHeader != null && !cookieHeader.isBlank()) {
             for (String part : cookieHeader.split(";\\s*")) {
@@ -536,7 +749,7 @@ public class BurpExtender implements BurpExtension {
                 if (eq > 0) map.put(part.substring(0, eq), part.substring(eq + 1));
             }
         }
-        map.put(name, value);
+        map.put(name, value != null ? value : ""); // Handle null value
         return map.entrySet().stream()
             .map(e -> e.getKey() + "=" + e.getValue())
             .collect(Collectors.joining("; "));
