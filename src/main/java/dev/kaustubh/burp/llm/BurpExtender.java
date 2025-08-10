@@ -30,6 +30,7 @@ import java.util.stream.Collectors;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 
 /**
  * Burp Suite extension that integrates with local LLM APIs to generate and execute security payloads
@@ -134,6 +135,7 @@ public class BurpExtender implements BurpExtension {
 
         // YAML parser for payload specifications
         private final ObjectMapper yaml = new ObjectMapper(new YAMLFactory());
+        private final ObjectMapper json = new ObjectMapper().configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
         private HttpRequestResponse seed; // The base request to modify with payloads
 
         
@@ -238,7 +240,8 @@ public class BurpExtender implements BurpExtension {
                 List<String> urlParams  = new ArrayList<>();
                 List<String> bodyParams = new ArrayList<>();
                 List<String> jsonParams = new ArrayList<>();
-                for (HttpParameter p : (r != null ? r.parameters() : List.<HttpParameter>of())) {
+                List<? extends HttpParameter> seedParams = (r != null) ? r.parameters() : java.util.Collections.emptyList();
+                for (HttpParameter p : seedParams) {
                     switch (p.type()) {
                         case URL  -> urlParams.add(p.name());
                         case BODY -> bodyParams.add(p.name());
@@ -322,7 +325,7 @@ public class BurpExtender implements BurpExtension {
         
         /**
          * Sends prompt to LLM API and processes response (streaming or non-streaming)
-         * If YAML payloads are received and firing is enabled, executes them via Burp
+         * If YAML/JSON payloads are received and firing is enabled, executes them via Burp
          */
         private void sendPromptAndMaybeFire() {
             String url = baseUrl();
@@ -344,10 +347,9 @@ public class BurpExtender implements BurpExtension {
 
             // Set system message based on YAML-only mode
             String sys = yamlOnlyBox.isSelected()
-                    ? "You are a payload generator. Return only one fenced YAML block with key 'payloads'. "
-                      + "Each item: {name, param, payload, type?} where type ∈ {URL,BODY,JSON,COOKIE}. "
-                      + "IMPORTANT: All payload values must be quoted strings, even if they contain JSON. "
-                      + "Example: payload: '{\"admin\": true}'. No prose."
+                    ? "You are a payload generator. Return ONE fenced block containing a `payloads` array. Prefer JSON, YAML is also acceptable. "
+                      + "Schema: { \"payloads\": [ { \"name\": \"...\", \"param\": \"...\", \"payload\": \"...\", \"type\": \"URL|BODY|JSON|COOKIE\" } ] }. "
+                      + "STRICT: Use DOUBLE quotes for all strings. Do not escape single quotes with backslashes. No prose, no prefix/suffix."
                     : "You are a senior appsec engineer. Keep answers concise.";
 
             try {
@@ -379,8 +381,6 @@ public class BurpExtender implements BurpExtension {
                         + "\"stream\":" + stream
                         + "}";
                 }
-
-
 
                 java.net.http.HttpRequest req = java.net.http.HttpRequest.newBuilder()
                         .uri(URI.create(url))
@@ -429,63 +429,110 @@ public class BurpExtender implements BurpExtension {
         }
 
         /**
-         * Processes LLM output - extracts YAML if in payload mode, fires payloads if enabled
+         * Processes LLM output - extracts JSON or YAML if in payload mode, fires payloads if enabled
          */
         private void handleModelOutput(String text) {
-            String y = extractYaml(text);
-            if (yamlOnlyBox.isSelected()) {
-                if (y == null || y.isBlank()) {
-                    appendOut("\n[parse] No YAML block found.\n");
-                    return;
-                }
-                long nowNs = System.nanoTime();
-                appendOut(String.format("[gen] YAML ready @ %s  (+%d ms)\n", 
-                        java.time.LocalTime.now(), (nowNs - tSendNs) / 1_000_000));
-                appendOut("\n" + y + "\n");
-                if (fireBox.isSelected()) fireFromYaml(y);
-            } else {
+            if (!yamlOnlyBox.isSelected()) {
                 appendOut("\n" + text + "\n");
+                return;
             }
+            // Try JSON first (more robust), then YAML, then raw fallbacks and repairs.
+            try {
+                String block = extractJson(text);
+                boolean usedJson = true;
+                if (block == null) {
+                    block = extractYaml(text);
+                    usedJson = false;
+                }
+                PayloadSpec spec = null;
+                String printed = null;
+
+                if (block != null) {
+                    printed = block;
+                    try {
+                        spec = usedJson ? json.readValue(block, PayloadSpec.class)
+                                        : yaml.readValue(block, PayloadSpec.class);
+                    } catch (Exception ex1) {
+                        if (!usedJson) {
+                            // Attempt to repair common YAML quoting issues (e.g., single-quoted with backslashes)
+                            String repaired = fixYamlWeirdQuotes(block);
+                            try { 
+                                spec = yaml.readValue(repaired, PayloadSpec.class); 
+                                printed = repaired;
+                            } catch (Exception ignore) { /* keep going to other fallbacks */ }
+                        }
+                    }
+                }
+
+                // Fallback: whole response as JSON?
+                if (spec == null) {
+                    String t = text.trim();
+                    if (t.startsWith("{") && t.endsWith("}")) {
+                        try { spec = json.readValue(t, PayloadSpec.class); printed = t; } catch (Exception ignore) {}
+                    }
+                }
+
+                // Fallback: whole response as YAML?
+                if (spec == null) {
+                    try { spec = yaml.readValue(text, PayloadSpec.class); printed = text; }
+                    catch (Exception ex2) {
+                        // Try a last repair pass on entire text
+                        String repaired = fixYamlWeirdQuotes(text);
+                        try { spec = yaml.readValue(repaired, PayloadSpec.class); printed = repaired; }
+                        catch (Exception ex3) {
+                            appendOut("\n[parse] Could not parse JSON/YAML payloads. Last error: " + ex3.getMessage() + "\n");
+                            return;
+                        }
+                    }
+                }
+
+                // If we got here, we have a spec
+                appendOut("\n" + (printed == null ? "" : printed) + "\n");
+                if (fireBox.isSelected()) fireFromSpec(spec);
+            } catch (Exception e) {
+                appendOut("\n[parse] Unexpected parse error: " + e + "\n");
+            }
+        }
+
+        /**
+         * Fires payloads from a parsed PayloadSpec (JSON/YAML)
+         */
+        private void fireFromSpec(PayloadSpec spec) {
+            if (spec == null || spec.payloads == null || spec.payloads.isEmpty()) {
+                appendOut("[fire] No payloads to send.\n");
+                return;
+            }
+            processPayloads(spec);
         }
 
         // ========================= PAYLOAD EXECUTION =========================
         
         /**
-         * Parses YAML payload specification and executes each payload via Burp HTTP API
+         * Parses YAML payload specification and executes each payload via Burp HTTP API (delegates to fireFromSpec)
          */
         private void fireFromYaml(String yamlText) {
             if (seed == null) {
                 appendOut("[fire] No seed selected. Right-click a request → Local LLM → Use this request as seed.\n");
                 return;
             }
-            if (debugBox.isSelected()) appendOut("[debug] Parsing YAML:\n" + yamlText + "\n");
-
+            if (debugBox.isSelected()) appendOut("[debug] Parsing (YAML-preferred) block…\n");
             try {
-                PayloadSpec spec = yaml.readValue(yamlText, PayloadSpec.class);
-                if (spec == null || spec.payloads == null || spec.payloads.isEmpty()) {
-                    appendOut("[fire] YAML parsed but no payloads found.\n");
-                    return;
-                }
-                processPayloads(spec);
-            } catch (Exception ex) {
-                appendOut("[fire] YAML parse/send error: " + ex + "\n");
-                if (debugBox.isSelected()) {
-                    ex.printStackTrace();
-                    appendOut("[debug] Attempting to fix YAML...\n");
-                }
-                // Attempt to fix common YAML formatting issues
+                // Try YAML first
+                PayloadSpec spec = null;
                 try {
-                    String fixedYaml = fixYamlPayloads(yamlText);
-                    if (debugBox.isSelected()) appendOut("[debug] Fixed YAML:\n" + fixedYaml + "\n");
-                    PayloadSpec spec = yaml.readValue(fixedYaml, PayloadSpec.class);
-                    if (spec != null && spec.payloads != null && !spec.payloads.isEmpty()) {
-                        appendOut("[fire] Successfully parsed fixed YAML with " + spec.payloads.size() + " payload(s).\n");
-                        processPayloads(spec);
-                        return;
+                    spec = yaml.readValue(yamlText, PayloadSpec.class);
+                } catch (Exception first) {
+                    // Try repair then JSON
+                    try {
+                        String fixed = fixYamlWeirdQuotes(yamlText);
+                        spec = yaml.readValue(fixed, PayloadSpec.class);
+                    } catch (Exception second) {
+                        spec = json.readValue(yamlText, PayloadSpec.class);
                     }
-                } catch (Exception ex2) {
-                    appendOut("[fire] Fixed YAML also failed: " + ex2.getMessage() + "\n");
                 }
+                fireFromSpec(spec);
+            } catch (Exception ex) {
+                appendOut("[fire] Parse failed: " + ex.getMessage() + "\n");
             }
         }
 
@@ -527,7 +574,7 @@ public class BurpExtender implements BurpExtension {
 
                     tasks.add(() -> {
                         String name = nz(p.name, p.param) + nameSuffix;
-                        String param = p.param;
+                        String param = saneParamName(p.param) ? p.param : chooseFallbackParam(base, String.valueOf(p.type));
                         String value = valueVariant;
 
                         HttpRequest mutated = base;
@@ -682,6 +729,85 @@ public class BurpExtender implements BurpExtension {
          */
         private static String escape(String s) {
             return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n");
+        }
+
+        /**
+         * Extracts JSON code block from markdown-formatted text
+         */
+        private static String extractJson(String text) {
+            // Look for ```json blocks
+            int last = -1, start = -1, end = -1, idx = 0;
+            while (true) {
+                int s1 = indexOfIgnoreCase(text, "```json", idx);
+                if (s1 < 0) break;
+                int s2 = text.indexOf('\n', s1);
+                int e  = text.indexOf("```", Math.max(s2, s1 + 7));
+                if (e > 0) { last = s1; start = s2 + 1; end = e; }
+                idx = s1 + 7;
+            }
+            if (last >= 0) return text.substring(start, end).trim();
+            return null;
+        }
+
+        private static int indexOfIgnoreCase(String hay, String needle, int from) {
+            final String h = hay.toLowerCase(Locale.ROOT);
+            final String n = needle.toLowerCase(Locale.ROOT);
+            return h.indexOf(n, from);
+        }
+
+        /**
+         * Repairs common YAML issues where single-quoted strings are used with backslashes,
+         * or where an extra trailing single quote appears. Converts to double-quoted JSON-style.
+         */
+        private static String fixYamlWeirdQuotes(String y) {
+            String[] lines = y.split("\\r?\\n");
+            StringBuilder out = new StringBuilder();
+            for (String line : lines) {
+                String trimmed = line.trim();
+                if (trimmed.startsWith("payload:")) {
+                    int i = line.indexOf("payload:");
+                    String before = line.substring(0, i + 8); // keep original indentation
+                    String after = line.substring(i + 8).trim();
+                    // Strip outer single quotes if present
+                    if (after.startsWith("'") && after.length() >= 2) {
+                        // Drop leading '
+                        after = after.substring(1);
+                        // If ends with two single quotes (YAML escape), drop one
+                        if (after.endsWith("''")) after = after.substring(0, after.length() - 1);
+                        // If ends with a single stray ', drop it
+                        else if (after.endsWith("'")) after = after.substring(0, after.length() - 1);
+                        // Unescape \' to ' and \\ to \
+                        after = after.replace("\\'", "'").replace("\\\\", "\\");
+                        // Re-escape for JSON double quotes
+                        String jsonEscaped = after.replace("\\", "\\\\").replace("\"", "\\\"");
+                        out.append(before).append(" \"").append(jsonEscaped).append("\"\n");
+                        continue;
+                    }
+                }
+                out.append(line).append("\n");
+            }
+            return out.toString();
+        }
+
+        private static boolean saneParamName(String s) {
+            return s != null && s.matches("[A-Za-z0-9._-]{1,64}");
+        }
+
+        private static String chooseFallbackParam(HttpRequest base, String typeHint) {
+            String hint = typeHint == null ? "" : typeHint.toUpperCase(Locale.ROOT);
+            // Prefer params that exist in the hinted location
+            List<? extends HttpParameter> params = base.parameters();
+            if ("COOKIE".equals(hint)) {
+                String cookie = base.headerValue("Cookie");
+                if (cookie != null && !cookie.isBlank()) {
+                    int eq = cookie.indexOf('=');
+                    if (eq > 0) return cookie.substring(0, eq).trim();
+                }
+            }
+            for (HttpParameter p : params) if (p.type() == HttpParameterType.URL)  return p.name();
+            for (HttpParameter p : params) if (p.type() == HttpParameterType.BODY) return p.name();
+            for (HttpParameter p : params) if (p.type() == HttpParameterType.JSON) return p.name();
+            return "q";
         }
 
         // ========================= ENCODING UTILITIES =========================
