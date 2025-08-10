@@ -1,0 +1,68 @@
+name: Bootstrap Release (one-time)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  release-current-main:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Read version from pom.xml
+        id: ver
+        run: |
+          VER=$(mvn -q -DforceStdout -Dexpression=project.version help:evaluate)
+          echo "value=$VER" >> $GITHUB_OUTPUT
+          echo "VER=$VER" >> $GITHUB_ENV
+
+      - name: Build shaded jar
+        run: mvn -B -DskipTests clean package
+
+      - name: Locate artifact
+        id: locate
+        run: |
+          FILE="target/local-llm-assistant-${{ steps.ver.outputs.value }}.jar"
+          if [ ! -f "$FILE" ]; then
+            echo "Shaded jar not found at $FILE"
+            ls -lah target
+            exit 1
+          fi
+          NAME="Local-LLM-Assistant-${{ steps.ver.outputs.value }}.jar"
+          cp "$FILE" "$NAME"
+          echo "file=$NAME" >> $GITHUB_OUTPUT
+
+      - name: Create tag if missing
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ steps.ver.outputs.value }}"
+          if git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists locally."
+          else
+            git tag "$TAG" "${GITHUB_SHA}"
+            git push origin "$TAG"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.value }}
+          name: Local LLM Assistant v${{ steps.ver.outputs.value }}
+          generate_release_notes: true
+          files: ${{ steps.locate.outputs.file }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
