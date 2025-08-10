@@ -4,7 +4,7 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>dev.kaustubh.burp</groupId>
   <artifactId>local-llm-assistant</artifactId>
-  <version>1.0.2</version>
+  <version>1.1.0</version>
   <name>Local LLM Assistant</name>
 
   <properties>
