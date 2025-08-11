@@ -4,7 +4,7 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>dev.kaustubh.burp</groupId>
   <artifactId>local-llm-assistant</artifactId>
-  <version>1.1.0</version>
+  <version>1.2.0</version>
   <name>Local LLM Assistant</name>
 
   <properties>
@@ -39,6 +39,11 @@
       <groupId>com.fasterxml.jackson.dataformat</groupId>
       <artifactId>jackson-dataformat-yaml</artifactId>
       <version>2.17.2</version>
+    </dependency>
+    <dependency>
+      <groupId>org.nanohttpd</groupId>
+      <artifactId>nanohttpd</artifactId>
+      <version>2.3.1</version>
     </dependency>
     <!-- TEST deps -->
     <dependency>

@@ -31,6 +31,7 @@ import java.util.stream.Collectors;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import com.fasterxml.jackson.databind.DeserializationFeature;
+import fi.iki.elonen.NanoHTTPD;
 
 /**
  * Burp Suite extension that integrates with local LLM APIs to generate and execute security payloads
@@ -106,6 +107,12 @@ public class BurpExtender implements BurpExtension {
         private final JCheckBox debugBox = new JCheckBox("Debug lines", false);
         private final JCheckBox fireBox = new JCheckBox("Send via Burp", true);
         private final JCheckBox repeaterBox = new JCheckBox("Also add to Repeater", false);
+
+        // MCP bridge controls
+        private final JCheckBox bridgeExposeBox = new JCheckBox("Expose MCP bridge", false);
+        private final JTextField bridgePortField = new JTextField("7071");
+        private final JTextField bridgeTokenField = new JTextField(""); // optional bearer token
+        private NanoBridge bridgeServer = null;
 
         // command mode: generate from short intent
         private final JCheckBox commandModeBox = new JCheckBox("Command mode", true);
@@ -196,6 +203,21 @@ public class BurpExtender implements BurpExtension {
             row2.add(encodeBox);
             row2.add(encodeTypeCombo);
 
+            JPanel row3 = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 0));
+            row3.add(new JLabel("MCP:"));
+            row3.add(bridgeExposeBox);
+            row3.add(new JLabel("Port:"));
+            row3.add(bridgePortField);
+            row3.add(new JLabel("Token:"));
+            bridgeTokenField.setColumns(12);
+            row3.add(bridgeTokenField);
+
+            // start/stop bridge when toggled
+            bridgeExposeBox.addActionListener(ev -> {
+                if (bridgeExposeBox.isSelected()) startBridgeServer();
+                else stopBridgeServer();
+            });
+
             // Enable/disable the encode type selector with the checkbox
             encodeTypeCombo.setEnabled(false);
             encodeBox.addActionListener(ev -> encodeTypeCombo.setEnabled(encodeBox.isSelected()));
@@ -205,6 +227,7 @@ public class BurpExtender implements BurpExtension {
             opts.setLayout(new BoxLayout(opts, BoxLayout.Y_AXIS));
             opts.add(row1);
             opts.add(row2);
+            opts.add(row3);
 
 
             // Assemble top section (settings + prompt input + options)
@@ -436,57 +459,56 @@ public class BurpExtender implements BurpExtension {
                 appendOut("\n" + text + "\n");
                 return;
             }
-            // Try JSON first (more robust), then YAML, then raw fallbacks and repairs.
             try {
-                String block = extractJson(text);
-                boolean usedJson = true;
-                if (block == null) {
-                    block = extractYaml(text);
-                    usedJson = false;
-                }
                 PayloadSpec spec = null;
                 String printed = null;
 
+                // 1) Prefer fenced block content (json/yaml/anything)
+                String block = extractJson(text);
+                if (block == null) block = extractYaml(text);
+                if (block == null) block = extractAnyFenced(text);
+
                 if (block != null) {
                     printed = block;
+                    // Try JSON first
                     try {
-                        spec = usedJson ? json.readValue(block, PayloadSpec.class)
-                                        : yaml.readValue(block, PayloadSpec.class);
-                    } catch (Exception ex1) {
-                        if (!usedJson) {
-                            // Attempt to repair common YAML quoting issues (e.g., single-quoted with backslashes)
-                            String repaired = fixYamlWeirdQuotes(block);
-                            try { 
-                                spec = yaml.readValue(repaired, PayloadSpec.class); 
+                        spec = json.readValue(block, PayloadSpec.class);
+                    } catch (Exception jex) {
+                        // Then YAML
+                        try {
+                            spec = yaml.readValue(block, PayloadSpec.class);
+                        } catch (Exception yex) {
+                            // Then repair YAML quotes and try again
+                            try {
+                                String repaired = fixYamlWeirdQuotes(block);
+                                spec = yaml.readValue(repaired, PayloadSpec.class);
                                 printed = repaired;
-                            } catch (Exception ignore) { /* keep going to other fallbacks */ }
+                            } catch (Exception ignore) { /* continue to fallbacks */ }
                         }
                     }
                 }
 
-                // Fallback: whole response as JSON?
+                // 2) Whole-response fallbacks
                 if (spec == null) {
                     String t = text.trim();
                     if (t.startsWith("{") && t.endsWith("}")) {
                         try { spec = json.readValue(t, PayloadSpec.class); printed = t; } catch (Exception ignore) {}
                     }
                 }
-
-                // Fallback: whole response as YAML?
                 if (spec == null) {
                     try { spec = yaml.readValue(text, PayloadSpec.class); printed = text; }
                     catch (Exception ex2) {
-                        // Try a last repair pass on entire text
-                        String repaired = fixYamlWeirdQuotes(text);
-                        try { spec = yaml.readValue(repaired, PayloadSpec.class); printed = repaired; }
-                        catch (Exception ex3) {
+                        try {
+                            String repaired = fixYamlWeirdQuotes(text);
+                            spec = yaml.readValue(repaired, PayloadSpec.class);
+                            printed = repaired;
+                        } catch (Exception ex3) {
                             appendOut("\n[parse] Could not parse JSON/YAML payloads. Last error: " + ex3.getMessage() + "\n");
                             return;
                         }
                     }
                 }
 
-                // If we got here, we have a spec
                 appendOut("\n" + (printed == null ? "" : printed) + "\n");
                 if (fireBox.isSelected()) fireFromSpec(spec);
             } catch (Exception e) {
@@ -636,6 +658,293 @@ public class BurpExtender implements BurpExtension {
         }
 
 
+        private SendResult processPayloadsCollecting(PayloadSpec spec, boolean encOverride, String encKindOverride) {
+            SendResult sr = new SendResult();
+            sr.results = new java.util.ArrayList<>();
+
+            if (seed == null || spec == null || spec.payloads == null || spec.payloads.isEmpty()) {
+                sr.count = 0;
+                sr.timing = new SendResult.Timing();
+                return sr;
+            }
+
+            final int MAX_PAR = 6;
+            long fireStartNs = System.nanoTime();
+
+            HttpRequest base = seed.request();
+            Http httpApi = api.http();
+            Repeater repeater = api.repeater();
+
+            final boolean doEncode = encOverride;
+            final String encKind = encKindOverride;
+
+            java.util.List<Callable<SendResult.Entry>> tasks = new java.util.ArrayList<>();
+            for (Payload p : spec.payloads) {
+                java.util.List<String[]> variants = new java.util.ArrayList<>();
+                variants.add(new String[] {"", p.payload}); // normal
+                if (doEncode) {
+                    variants.add(new String[] {" [enc=" + encKind + "]", encodeValue(p.payload, encKind)});
+                }
+
+                for (String[] vv : variants) {
+                    final String nameSuffix = vv[0];
+                    final String valueVariant = vv[1];
+
+                    tasks.add(() -> {
+                        String name = nz(p.name, p.param) + nameSuffix;
+                        String param = saneParamName(p.param) ? p.param : chooseFallbackParam(base, String.valueOf(p.type));
+                        String value = valueVariant;
+
+                        HttpRequest mutated = base;
+
+                        if ("COOKIE".equalsIgnoreCase(String.valueOf(p.type))) {
+                            String current = mutated.headerValue("Cookie");
+                            String merged = BurpExtender.mergeCookie(current, param, value);
+                            mutated = mutated.withHeader("Cookie", merged);
+                        } else {
+                            HttpParameterType type = chooseType(p.type, base);
+                            HttpParameter hp = HttpParameter.parameter(param, value, type);
+                            mutated = base.withParameter(hp);
+                        }
+
+                        long t0 = System.nanoTime();
+                        HttpRequestResponse rr = httpApi.sendRequest(mutated);
+                        long dtMs = (System.nanoTime() - t0) / 1_000_000;
+
+                        HttpResponse r = rr.response();
+                        int sc = (r == null) ? -1 : r.statusCode();
+                        int blen = (r == null || r.body() == null) ? 0 : r.body().length();
+
+                        if (repeaterBox.isSelected()) {
+                            repeater.sendToRepeater(mutated, "LLM/" + name);
+                        }
+
+                        SendResult.Entry e = new SendResult.Entry();
+                        e.name = name;
+                        e.status = sc;
+                        e.bytes = blen;
+                        e.ms = (int) dtMs;
+                        return e;
+                    });
+                }
+            }
+
+            java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(MAX_PAR);
+            try {
+                var futures = pool.invokeAll(tasks);
+                for (var f : futures) {
+                    try { sr.results.add(f.get()); }
+                    catch (Exception ex) {
+                        SendResult.Entry e = new SendResult.Entry();
+                        e.name = "error";
+                        e.status = -1;
+                        e.bytes = 0;
+                        e.ms = 0;
+                        sr.results.add(e);
+                    }
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            } finally {
+                pool.shutdown();
+            }
+
+            long fireMs = (System.nanoTime() - fireStartNs) / 1_000_000;
+            sr.count = sr.results.size();
+            sr.timing = new SendResult.Timing();
+            sr.timing.fire_ms = (int) fireMs;
+            return sr;
+        }
+        private SeedInfo buildSeedInfo(HttpRequest r) {
+            SeedInfo info = new SeedInfo();
+            if (r == null) return info;
+
+            String scheme = r.httpService().secure() ? "https" : "http";
+            String host = r.httpService().host();
+            int port = r.httpService().port();
+            info.method = r.method();
+            info.url = scheme + "://" + host + ":" + port + r.path();
+
+            info.headers = new LinkedHashMap<>();
+            String cookie = r.headerValue("Cookie");
+            if (cookie != null) info.headers.put("Cookie", cookie);
+            String ct = r.headerValue("Content-Type");
+            if (ct != null) info.headers.put("Content-Type", ct);
+
+            info.params = new LinkedHashMap<>();
+            java.util.List<String> urlParams  = new java.util.ArrayList<>();
+            java.util.List<String> bodyParams = new java.util.ArrayList<>();
+            java.util.List<String> jsonParams = new java.util.ArrayList<>();
+
+            for (var p : r.parameters()) {
+                switch (p.type()) {
+                    case URL  -> urlParams.add(p.name());
+                    case BODY -> bodyParams.add(p.name());
+                    case JSON -> jsonParams.add(p.name());
+                    default -> {}
+                }
+            }
+            java.util.List<String> cookieParams = new java.util.ArrayList<>();
+            if (cookie != null && !cookie.isBlank()) {
+                for (String part : cookie.split(";\\s*")) {
+                    int eq = part.indexOf('=');
+                    if (eq > 0) cookieParams.add(part.substring(0, eq));
+                }
+            }
+
+            info.params.put("url", urlParams);
+            info.params.put("body", bodyParams);
+            info.params.put("json", jsonParams);
+            info.params.put("cookie", cookieParams);
+            return info;
+        }
+
+
+        // Lightweight embedded HTTP server (no JDK module dependency)
+        private class NanoBridge extends NanoHTTPD {
+            NanoBridge(int port) { super("127.0.0.1", port); }
+
+            @Override
+            public Response serve(IHTTPSession session) {
+                try {
+                    String uri = session.getUri();
+                    Method method = session.getMethod();
+                    String auth = session.getHeaders().getOrDefault("authorization", "");
+
+                    if (!authOk(auth)) {
+                        return newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Unauthorized");
+                    }
+
+                    if (Method.GET.equals(method) && "/v1/seed".equals(uri)) {
+                        HttpRequest r = (seed != null) ? seed.request() : null;
+                        SeedInfo info = buildSeedInfo(r);
+                        String out = json.writeValueAsString(info);
+                        return newFixedLengthResponse(Response.Status.OK, "application/json", out);
+                    }
+
+                    if (Method.POST.equals(method) && "/v1/send".equals(uri)) {
+                        Map<String,String> files = new HashMap<>();
+                        session.parseBody(files);
+                        String body = files.getOrDefault("postData", "");
+                        SendRequest req = json.readValue(body, SendRequest.class);
+
+                        PayloadSpec spec = new PayloadSpec();
+                        spec.payloads = req.payloads;
+
+                        SendResult result = processPayloadsCollecting(
+                                spec,
+                                req.encode != null && Boolean.TRUE.equals(req.encode.enable),
+                                (req.encode != null ? req.encode.kind : null)
+                        );
+
+                        String out = json.writeValueAsString(result);
+                        return newFixedLengthResponse(Response.Status.OK, "application/json", out);
+                    }
+
+                    return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Not Found");
+                } catch (Exception e) {
+                    return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Error: " + e.getMessage());
+                }
+            }
+
+            private boolean authOk(String hdr) {
+                String token = bridgeTokenField.getText().trim();
+                if (token.isEmpty()) return true;
+                return ("Bearer " + token).equals(hdr);
+            }
+        }
+
+        private void startBridgeServer() {
+            stopBridgeServer();
+            try {
+                int port = Integer.parseInt(bridgePortField.getText().trim());
+                bridgeServer = new NanoBridge(port);
+                bridgeServer.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false);
+                appendOut(String.format("[bridge] MCP HTTP bridge on http://127.0.0.1:%d\n", port));
+            } catch (Exception ex) {
+                appendOut("[bridge] start failed: " + ex + "\n");
+                bridgeExposeBox.setSelected(false);
+                bridgeServer = null;
+            }
+        }
+
+        private void stopBridgeServer() {
+            if (bridgeServer != null) {
+                bridgeServer.stop();
+                bridgeServer = null;
+                appendOut("[bridge] stopped\n");
+            }
+        }
+
+        // private boolean checkAuth(HttpExchange ex) {
+        //     String token = bridgeTokenField.getText().trim();
+        //     if (token.isEmpty()) return true;
+        //     String hdr = ex.getRequestHeaders().getFirst("Authorization");
+        //     if (hdr != null && hdr.equals("Bearer " + token)) return true;
+        //     try {
+        //         ex.getResponseHeaders().add("Content-Type", "text/plain");
+        //         ex.sendResponseHeaders(401, 0);
+        //         ex.getResponseBody().write("Unauthorized".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        //     } catch (Exception ignore) {}
+        //     try { ex.close(); } catch (Exception ignore) {}
+        //     return false;
+        // }
+
+        // private void handleSeed(HttpExchange ex) {
+        //     try {
+        //         if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
+        //             ex.sendResponseHeaders(405, -1); ex.close(); return;
+        //         }
+        //         if (!checkAuth(ex)) return;
+
+        //         var r = (seed != null) ? seed.request() : null;
+        //         SeedInfo info = buildSeedInfo(r);
+        //         byte[] out = json.writeValueAsBytes(info);
+        //         ex.getResponseHeaders().add("Content-Type", "application/json");
+        //         ex.sendResponseHeaders(200, out.length);
+        //         ex.getResponseBody().write(out);
+        //     } catch (Exception e) {
+        //         try { ex.sendResponseHeaders(500, 0); } catch (Exception ignore) {}
+        //     } finally {
+        //         ex.close();
+        //     }
+        // }
+
+        // private void handleSend(HttpExchange ex) {
+        //     try {
+        //         if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
+        //             ex.sendResponseHeaders(405, -1); ex.close(); return;
+        //         }
+        //         if (!checkAuth(ex)) return;
+
+        //         String body = new String(ex.getRequestBody().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+        //         SendRequest req = json.readValue(body, SendRequest.class);
+
+        //         // Build a PayloadSpec from the request
+        //         PayloadSpec spec = new PayloadSpec();
+        //         spec.payloads = req.payloads;
+
+        //         SendResult result = processPayloadsCollecting(spec,
+        //                 req.encode != null && Boolean.TRUE.equals(req.encode.enable),
+        //                 (req.encode != null ? req.encode.kind : null));
+
+        //         byte[] out = json.writeValueAsBytes(result);
+        //         ex.getResponseHeaders().add("Content-Type", "application/json");
+        //         ex.sendResponseHeaders(200, out.length);
+        //         ex.getResponseBody().write(out);
+        //     } catch (Exception e) {
+        //         try {
+        //             String msg = ("Error: " + e.getMessage());
+        //             byte[] out = msg.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        //             ex.getResponseHeaders().add("Content-Type", "text/plain");
+        //             ex.sendResponseHeaders(400, out.length);
+        //             ex.getResponseBody().write(out);
+        //         } catch (Exception ignore) {}
+        //     } finally {
+        //         ex.close();
+        //     }
+        // }
+
         // Helper method to use first non-blank string
         private static String nz(String a, String b) { return (a != null && !a.isBlank()) ? a : b; }
 
@@ -746,6 +1055,25 @@ public class BurpExtender implements BurpExtension {
                 idx = s1 + 7;
             }
             if (last >= 0) return text.substring(start, end).trim();
+            return null;
+        }
+
+        /** Extract inner content of the last ```...``` fenced block (any language). */
+        private static String extractAnyFenced(String text) {
+            int idx = 0;
+            int start = -1, end = -1;
+            while (true) {
+                int open = text.indexOf("```", idx);
+                if (open < 0) break;
+                int nl = text.indexOf('\n', open + 3);
+                if (nl < 0) break; // malformed fence
+                int close = text.indexOf("```", nl + 1);
+                if (close < 0) break;
+                start = nl + 1;
+                end = close;
+                idx = close + 3; // keep the last block found
+            }
+            if (start >= 0 && end > start) return text.substring(start, end).trim();
             return null;
         }
 
@@ -860,6 +1188,27 @@ public class BurpExtender implements BurpExtension {
      * Individual payload definition with name, parameter, value, and type
      */
     public static class Payload { public String name; public String param; public String payload; public String type; }
+
+    public static class SendRequest {
+        public Encode encode;
+        public java.util.List<Payload> payloads;
+        public static class Encode { public Boolean enable; public String kind; }
+    }
+
+    public static class SeedInfo {
+        public String method = "";
+        public String url = "";
+        public java.util.Map<String,String> headers = new java.util.LinkedHashMap<>();
+        public java.util.Map<String,java.util.List<String>> params = new java.util.LinkedHashMap<>();
+    }
+
+    public static class SendResult {
+        public int count;
+        public java.util.List<Entry> results;
+        public Timing timing;
+        public static class Entry { public String name; public int status; public int bytes; public int ms; }
+        public static class Timing { public int fire_ms; }
+    }
 
     // ========================= COOKIE UTILITIES =========================
     
